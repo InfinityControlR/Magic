@@ -11,7 +11,7 @@ if identifyexecutor then
     end
 end
 
-local BASE = 'https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/games/'
+local BASE = 'https://raw.githubusercontent.com/InfinityControlR/Magic/main/games/'
 
 local games = {
     [9190691]    = 'anime-squadron.lua',
