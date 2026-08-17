@@ -7,6 +7,8 @@
 local Module = {}
 
 function Module.create(context)
+    local runService = game:GetService("RunService")
+    local bindName = "MagicLootWalkingControl"
     local state = {
         active = false,
         generation = 0,
@@ -16,7 +18,12 @@ function Module.create(context)
         humanoid = nil,
         root = nil,
         destination = nil,
-        lastMoveAt = 0,
+        bound = false,
+        bestDistance = math.huge,
+        lastProgressAt = 0,
+        retryStage = nil,
+        retryStagePart = nil,
+        retryAt = 0,
     }
 
     local api = {}
@@ -26,6 +33,12 @@ function Module.create(context)
         local humanoid = state.humanoid
         local root = state.root
 
+        if state.bound then
+            pcall(function()
+                runService:UnbindFromRenderStep(bindName)
+            end)
+        end
+
         state.generation = state.generation + 1
         state.active = false
         state.heartbeat = 0
@@ -34,11 +47,16 @@ function Module.create(context)
         state.humanoid = nil
         state.root = nil
         state.destination = nil
-        state.lastMoveAt = 0
+        state.bound = false
+        state.bestDistance = math.huge
+        state.lastProgressAt = 0
+        state.retryStage = nil
+        state.retryStagePart = nil
+        state.retryAt = 0
 
         if wasActive and humanoid ~= nil and root ~= nil then
             pcall(function()
-                humanoid:MoveTo(root.Position)
+                humanoid:Move(Vector3.new(0, 0, 0), false)
             end)
         end
     end
@@ -81,6 +99,11 @@ function Module.create(context)
         then
             stop()
         end
+        if state.retryAt > 0
+            and (state.retryStage ~= stage or state.retryStagePart ~= stagePart)
+        then
+            stop()
+        end
     end
 
     function api:Update(mode, stage, stagePart, root, destination)
@@ -101,13 +124,30 @@ function Module.create(context)
             return "stage " .. tostring(stage) .. " waiting for character"
         end
 
-        local distance = (root.Position - destination).Magnitude
+        local delta = destination - root.Position
+        local planar = Vector3.new(delta.X, 0, delta.Z)
+        local distance = planar.Magnitude
         if distance <= 4 then
             stop()
             return "stage " .. tostring(stage) .. " walking arrived"
         end
 
         local now = os.clock()
+        if state.retryAt > now
+            and state.retryStage == stage
+            and state.retryStagePart == stagePart
+        then
+            return string.format(
+                "stage %d walking stalled; retry in %.1fs",
+                stage,
+                state.retryAt - now
+            )
+        elseif state.retryAt > 0 then
+            state.retryStage = nil
+            state.retryStagePart = nil
+            state.retryAt = 0
+        end
+
         local sameRoute = state.active
             and state.stage == stage
             and state.stagePart == stagePart
@@ -118,13 +158,6 @@ function Module.create(context)
 
         if not sameRoute then
             stop()
-            local moved = pcall(function()
-                humanoid:MoveTo(destination)
-            end)
-            if not moved then
-                return "stage " .. tostring(stage) .. " walking unavailable"
-            end
-
             state.active = true
             state.generation = state.generation + 1
             state.stage = stage
@@ -132,17 +165,53 @@ function Module.create(context)
             state.humanoid = humanoid
             state.root = root
             state.destination = destination
-            state.lastMoveAt = now
-            startWatchdog(state.generation)
-        elseif now - state.lastMoveAt >= 2.5 then
+            state.bestDistance = distance
+            state.lastProgressAt = now
+
             local moved = pcall(function()
-                humanoid:MoveTo(destination)
+                runService:UnbindFromRenderStep(bindName)
+                runService:BindToRenderStep(
+                    bindName,
+                    Enum.RenderPriority.Character.Value + 1,
+                    function()
+                        if not state.active
+                            or state.humanoid ~= humanoid
+                            or state.root ~= root
+                            or state.destination == nil
+                        then
+                            return
+                        end
+
+                        local currentDelta = state.destination - root.Position
+                        local currentPlanar = Vector3.new(
+                            currentDelta.X,
+                            0,
+                            currentDelta.Z
+                        )
+                        if currentPlanar.Magnitude <= 4 then
+                            humanoid:Move(Vector3.new(0, 0, 0), false)
+                        else
+                            humanoid:Move(currentPlanar.Unit, false)
+                        end
+                    end
+                )
             end)
             if not moved then
                 stop()
                 return "stage " .. tostring(stage) .. " walking unavailable"
             end
-            state.lastMoveAt = now
+
+            state.bound = true
+            startWatchdog(state.generation)
+        elseif distance <= state.bestDistance - 0.5 then
+            state.bestDistance = distance
+            state.lastProgressAt = now
+        elseif now - state.lastProgressAt > 6 then
+            stop()
+            state.retryStage = stage
+            state.retryStagePart = stagePart
+            state.retryAt = now + 5
+            return "stage " .. tostring(stage) .. " walking stalled; attacks resumed"
         end
 
         state.heartbeat = now
