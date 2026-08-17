@@ -8,7 +8,10 @@ local Module = {}
 
 function Module.create(context)
     local runService = game:GetService("RunService")
-    local bindName = "MagicLootWalkingControl"
+    local bindName = "MagicLootWalkingControl_"
+        .. tostring(math.random(1, 1000000000))
+        .. "_"
+        .. tostring(os.clock())
     local state = {
         active = false,
         generation = 0,
@@ -178,6 +181,9 @@ function Module.create(context)
                             or state.humanoid ~= humanoid
                             or state.root ~= root
                             or state.destination == nil
+                            or humanoid.Parent == nil
+                            or humanoid.Health <= 0
+                            or root.Parent == nil
                         then
                             return
                         end
