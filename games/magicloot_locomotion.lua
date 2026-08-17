@@ -150,7 +150,10 @@ function Module.create(context)
     end
 
     function api:BlocksAttack()
-        return false
+        if state.active and os.clock() - state.heartbeat > 1 then
+            stop()
+        end
+        return state.active
     end
 
     function api:Stop()
