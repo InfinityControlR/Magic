@@ -8,6 +8,7 @@ local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
 local TextService = game:GetService("TextService")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
@@ -29,6 +30,9 @@ local CONFIG = {
     MaxTableItems = 24,
     MaxStringLength = 500,
     CorrelationSeconds = 2,
+    MaxPendingRemoteRecords = 240,
+    MaxRemoteRecordsPerHeartbeat = 80,
+    RenderIntervalSeconds = 0.12,
 }
 
 local rootGui = Instance.new("ScreenGui")
@@ -277,6 +281,9 @@ local hookFunction = nil
 local hookInstaller = nil
 local minimized = false
 local renderScheduled = false
+local lastRenderAt = 0
+local pendingRemoteRecords = {}
+local droppedRemoteRecords = 0
 
 local function setWindowAbsolutePosition(topLeft)
     local camera = workspace.CurrentCamera
@@ -596,7 +603,11 @@ local function describeAncestors(button)
     local current = button
     local depth = 0
     while current ~= nil and current ~= PlayerGui and depth < 14 do
-        table.insert(parts, cleanText(current.ClassName, 80) .. ":" .. cleanText(current.Name, 160))
+        table.insert(
+            parts,
+            cleanText(safeProperty(current, "ClassName"), 80)
+                .. ":" .. cleanText(safeProperty(current, "Name"), 160)
+        )
         current = safeProperty(current, "Parent")
         depth = depth + 1
     end
@@ -634,10 +645,12 @@ local function renderReport()
     local lines = {
         "MAGIC LOOT BUTTON/ACTION INSPECTOR",
         string.format(
-            "elapsed=%.1fs | buttons=%d | events=%d | errors=%d | remote-spy=%s",
+            "elapsed=%.1fs | buttons=%d | events=%d | pending=%d | dropped=%d | errors=%d | remote-spy=%s",
             os.clock() - startedAt,
             attachedButtons,
             #timeline,
+            #pendingRemoteRecords,
+            droppedRemoteRecords,
             readErrors,
             hookInstalled and "ON" or "UNAVAILABLE"
         ),
@@ -773,16 +786,10 @@ local function renderReport()
 end
 
 local function scheduleRender()
-    if minimized or renderScheduled or not alive or closed then
+    if minimized or not alive or closed then
         return
     end
     renderScheduled = true
-    task.delay(0.12, function()
-        renderScheduled = false
-        if alive and not closed and not minimized then
-            renderReport()
-        end
-    end)
 end
 
 local function recordButton(button, inputObject, clickCount)
@@ -817,8 +824,8 @@ local function recordButton(button, inputObject, clickCount)
         kind = "BUTTON",
         clock = os.clock(),
         path = safeFullName(button),
-        className = cleanText(button.ClassName, 100),
-        name = cleanText(button.Name, 200),
+        className = cleanText(safeProperty(button, "ClassName"), 100),
+        name = cleanText(safeProperty(button, "Name"), 200),
         content = content,
         input = inputDescription,
         clickCount = cleanText(clickCount, 40),
@@ -872,6 +879,50 @@ recordRemote = function(method, remote, arguments, capturedClock)
     considerCorrelatedRemote(remoteEntry)
     if not minimized then
         scheduleRender()
+    end
+end
+
+local function enqueueRemoteCapture(method, remote, clonedArguments, capturedClock)
+    if not alive or closed or not hookActive then
+        return
+    end
+    while #pendingRemoteRecords >= CONFIG.MaxPendingRemoteRecords do
+        table.remove(pendingRemoteRecords, 1)
+        droppedRemoteRecords = droppedRemoteRecords + 1
+    end
+    table.insert(pendingRemoteRecords, {
+        method = method,
+        remote = remote,
+        arguments = clonedArguments,
+        clock = capturedClock,
+    })
+end
+
+local function pumpInspector()
+    if not alive or closed then
+        return
+    end
+
+    local recordsToDrain = math.min(
+        #pendingRemoteRecords,
+        CONFIG.MaxRemoteRecordsPerHeartbeat
+    )
+    for _ = 1, recordsToDrain do
+        local capture = table.remove(pendingRemoteRecords, 1)
+        snapshotAndRecordRemote(
+            capture.method,
+            capture.remote,
+            capture.arguments,
+            capture.clock
+        )
+    end
+
+    local now = os.clock()
+    if renderScheduled and not minimized
+        and now - lastRenderAt >= CONFIG.RenderIntervalSeconds then
+        lastRenderAt = now
+        renderScheduled = false
+        renderReport()
     end
 end
 
@@ -960,15 +1011,14 @@ local function installRemoteObserver()
             readErrors = readErrors + 1
             clonedArguments = table.pack("<argument clone failed>")
         end
-        local deferOk = pcall(
-            task.defer,
-            snapshotAndRecordRemote,
+        local enqueueOk = pcall(
+            enqueueRemoteCapture,
             method,
             self,
             clonedArguments,
             os.clock()
         )
-        if not deferOk then
+        if not enqueueOk then
             readErrors = readErrors + 1
         end
         return originalNamecall(self, ...)
@@ -1049,6 +1099,7 @@ local function closeInspector()
         end
     end
     hookInstalled = false
+    pendingRemoteRecords = {}
     timeline = {}
     latestReport = ""
     latestButton = nil
@@ -1085,7 +1136,7 @@ table.insert(globalConnections, minimizeButton.Activated:Connect(function()
         hintLabel.Visible = true
         scroll.Visible = true
         minimizeButton.Text = "-"
-        renderReport()
+        scheduleRender()
     end
     task.defer(function()
         if alive and not closed then
@@ -1095,12 +1146,15 @@ table.insert(globalConnections, minimizeButton.Activated:Connect(function()
 end))
 
 table.insert(globalConnections, clearButton.Activated:Connect(function()
+    pendingRemoteRecords = {}
+    droppedRemoteRecords = 0
     timeline = {}
     latestButton = nil
     latestButtonRecord = nil
     correlatedRemotes = {}
     latestReport = ""
-    renderReport()
+    renderScheduled = false
+    scheduleRender()
 end))
 
 table.insert(globalConnections, copyButton.Activated:Connect(function()
@@ -1167,6 +1221,16 @@ table.insert(globalConnections, PlayerGui.DescendantRemoving:Connect(function(de
     disconnectButton(descendant)
 end))
 
+-- The __namecall hook can run with a restricted executor capability context.
+-- Keep all popup Instance access in this top-level signal connection instead.
+table.insert(globalConnections, RunService.Heartbeat:Connect(function()
+    local pumpOk = pcall(pumpInspector)
+    if not pumpOk then
+        readErrors = readErrors + 1
+        renderScheduled = false
+    end
+end))
+
 local descendantsOk, descendants = pcall(function()
     return PlayerGui:GetDescendants()
 end)
@@ -1190,4 +1254,7 @@ else
     })
 end
 
-renderReport()
+local initialRenderOk = pcall(renderReport)
+if not initialRenderOk then
+    readErrors = readErrors + 1
+end
