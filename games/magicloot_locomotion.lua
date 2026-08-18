@@ -17,6 +17,7 @@ function Module.create(context)
         .. tostring(os.clock())
     local state = {
         active = false,
+        enteredStage = false,
         generation = 0,
         heartbeat = 0,
         preparedStage = nil,
@@ -330,6 +331,7 @@ function Module.create(context)
 
         state.generation = state.generation + 1
         state.active = false
+        state.enteredStage = false
         state.heartbeat = 0
         state.stage = nil
         state.stagePart = nil
@@ -392,6 +394,22 @@ function Module.create(context)
         local localPoint = part.CFrame:PointToObjectSpace(point)
         return math.abs(localPoint.X) <= part.Size.X * 0.5
             and math.abs(localPoint.Z) <= part.Size.Z * 0.5
+    end
+
+    local function hasEnteredStage()
+        if state.enteredStage then
+            return true
+        end
+        if state.stagePart == nil or state.root == nil then
+            return false
+        end
+        local ok, inside = pcall(function()
+            return isOverFootprint(state.stagePart, state.root.Position)
+        end)
+        if ok and inside then
+            state.enteredStage = true
+        end
+        return state.enteredStage
     end
 
     local function chooseInitialDestination(stage, stagePart, root, destination)
@@ -635,6 +653,7 @@ function Module.create(context)
                 destination
             )
             state.active = true
+            state.enteredStage = isOverFootprint(stagePart, root.Position)
             state.generation = state.generation + 1
             state.stage = stage
             state.stagePart = stagePart
@@ -685,6 +704,8 @@ function Module.create(context)
             state.bound = true
             startWatchdog(state.generation)
         end
+
+        hasEnteredStage()
 
         local distance = planarDistance(state.destination, root.Position)
         if state.phase == "align" and distance <= 4 then
@@ -738,7 +759,7 @@ function Module.create(context)
         if state.active and os.clock() - state.heartbeat > 1 then
             resetAll()
         end
-        return state.active
+        return state.active and not hasEnteredStage()
     end
 
     function api:StopWalking()
