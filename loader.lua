@@ -14,6 +14,10 @@ end
 local BASE = 'https://raw.githubusercontent.com/InfinityControlR/Magic/codex/testing/games/'
 local LOCOMOTION = BASE .. 'magicloot_locomotion.lua'
 
+local function latest(url)
+    return url .. '?v=' .. tostring(os.time()) .. '-' .. tostring(math.random(1, 1000000000))
+end
+
 local games = {
     [118455659]  = 'magicloot.lua',
 }
@@ -24,7 +28,7 @@ if file then
 
     local factory = nil
     local extensionOk, extension = pcall(function()
-        local source = game:HttpGet(LOCOMOTION)
+        local source = game:HttpGet(latest(LOCOMOTION))
         local chunk, compileError = loadstring(source)
         if type(chunk) ~= 'function' then
             error(tostring(compileError or 'locomotion compile failed'))
@@ -39,7 +43,7 @@ if file then
         factory = extension
     end
 
-    local source = game:HttpGet(BASE .. file)
+    local source = game:HttpGet(latest(BASE .. file))
     local chunk, compileError = loadstring(source)
     if type(chunk) ~= 'function' then
         error(tostring(compileError or 'Magic Loot compile failed'))
