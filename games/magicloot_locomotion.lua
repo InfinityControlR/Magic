@@ -582,6 +582,7 @@ function Module.create(context)
         if not grounded or floorMaterial == Enum.Material.Air then return end
         local jumped = pcall(function()
             humanoid.Jump = true
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
         end)
         if jumped then state.lastJumpAt = now end
     end
@@ -914,6 +915,11 @@ function Module.create(context)
                         else
                             humanoid:Move(currentPlanar.Unit, false)
                         end
+                        if state.mode == "Running" and state.enteredStage then
+                            -- Run after the normal character controller so its
+                            -- per-frame Jump=false cannot cancel this request.
+                            jumpWhileRunning(humanoid, os.clock())
+                        end
                     end
                 )
             end)
@@ -934,7 +940,6 @@ function Module.create(context)
                 root,
                 destination
             )
-            jumpWhileRunning(humanoid, now)
 
             local stallStatus = updateStall(
                 stage,
