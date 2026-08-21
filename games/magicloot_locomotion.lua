@@ -1,4 +1,4 @@
--- Magic Loot external controller - Walking locomotion plus native Broom jump
+-- Magic Loot external controller - Walking/Running locomotion plus native Broom jump
 --
 -- This module never teleports the character and never changes movement speed.
 -- It is loaded behind a protected bridge in the main script; a load/runtime
@@ -11,7 +11,7 @@ function Module.create(context)
     local runService = game:GetService("RunService")
     local players = game:GetService("Players")
     local replicatedStorage = game:GetService("ReplicatedStorage")
-    local bindName = "MagicLootWalkingControl_"
+    local bindName = "MagicLootLocomotionControl_"
         .. tostring(math.random(1, 1000000000))
         .. "_"
         .. tostring(os.clock())
@@ -20,6 +20,7 @@ function Module.create(context)
         enteredStage = false,
         generation = 0,
         heartbeat = 0,
+        preparedMode = nil,
         preparedStage = nil,
         preparedStagePart = nil,
         routeChangedAt = 0,
@@ -39,9 +40,19 @@ function Module.create(context)
         resetUsedStage = nil,
         blockedStage = nil,
         settleUntil = 0,
+        mode = nil,
+        orbitAngle = 0,
+        orbitRadius = 0,
+        lastJumpAt = -math.huge,
     }
 
     local api = {}
+
+    local DEFAULT_RUNNING_DISTANCE = 12
+    local MIN_RUNNING_DISTANCE = 4
+    local MAX_RUNNING_DISTANCE = 50
+    local RUNNING_ORBIT_STEP = math.rad(45)
+    local RUNNING_JUMP_INTERVAL = 0.9
 
     -- Broom only asks the server to jump to the selected stage. It deliberately
     -- never toggles/equips the broom; the game keeps ownership of the transition.
@@ -345,6 +356,7 @@ function Module.create(context)
     end
 
     local function clearPreparedRoute()
+        state.preparedMode = nil
         state.preparedStage = nil
         state.preparedStagePart = nil
         state.routeChangedAt = 0
@@ -365,6 +377,7 @@ function Module.create(context)
         state.active = false
         state.enteredStage = false
         state.heartbeat = 0
+        state.mode = nil
         state.stage = nil
         state.stagePart = nil
         state.humanoid = nil
@@ -375,6 +388,9 @@ function Module.create(context)
         state.bound = false
         state.lastPosition = nil
         state.lastMovedAt = 0
+        state.orbitAngle = 0
+        state.orbitRadius = 0
+        state.lastJumpAt = -math.huge
 
         if wasActive and humanoid ~= nil and root ~= nil then
             pcall(function()
@@ -392,6 +408,23 @@ function Module.create(context)
     local function planarDistance(left, right)
         local delta = left - right
         return Vector3.new(delta.X, 0, delta.Z).Magnitude
+    end
+
+    local function readRunningDistance()
+        if type(context) ~= "table" or type(context.option) ~= "function" then
+            return DEFAULT_RUNNING_DISTANCE
+        end
+        local ok, value = pcall(
+            context.option,
+            "RunningDistance",
+            DEFAULT_RUNNING_DISTANCE
+        )
+        local numeric = ok and tonumber(value) or DEFAULT_RUNNING_DISTANCE
+        return math.clamp(
+            numeric or DEFAULT_RUNNING_DISTANCE,
+            MIN_RUNNING_DISTANCE,
+            MAX_RUNNING_DISTANCE
+        )
     end
 
     local function readEnterDelay()
@@ -482,10 +515,120 @@ function Module.create(context)
         return Vector3.new(entry.X, destination.Y, entry.Z), "align"
     end
 
-    local function notifyReset()
-        if type(context) == "table" and type(context.notify) == "function" then
-            pcall(context.notify, "Walking stuck for 20s; resetting character")
+    local function runningOrbitPoint(stagePart, center, angle, radius)
+        local localOffset = Vector3.new(
+            math.cos(angle) * radius,
+            0,
+            math.sin(angle) * radius
+        )
+        local worldOffset = stagePart.CFrame:VectorToWorldSpace(localOffset)
+        return center + Vector3.new(worldOffset.X, 0, worldOffset.Z)
+    end
+
+    local function startRunningOrbit(stagePart, root, center)
+        local localRoot = stagePart.CFrame:PointToObjectSpace(root.Position)
+        local planarMagnitude = Vector3.new(localRoot.X, 0, localRoot.Z).Magnitude
+        local entryAngle = planarMagnitude >= 1
+            and math.atan2(localRoot.Z, localRoot.X)
+            or 0
+        state.orbitAngle = entryAngle + RUNNING_ORBIT_STEP
+        state.orbitRadius = readRunningDistance()
+        state.destination = runningOrbitPoint(
+            stagePart,
+            center,
+            state.orbitAngle,
+            state.orbitRadius
+        )
+        state.phase = "orbit"
+        state.lastPosition = root.Position
+        state.lastMovedAt = os.clock()
+    end
+
+    local function updateRunningOrbit(stagePart, root, center)
+        if state.phase ~= "orbit" then
+            startRunningOrbit(stagePart, root, center)
         end
+
+        local radius = readRunningDistance()
+        if math.abs(radius - state.orbitRadius) > 0.05 then
+            state.orbitRadius = radius
+            state.destination = runningOrbitPoint(
+                stagePart,
+                center,
+                state.orbitAngle,
+                radius
+            )
+        end
+
+        local distance = planarDistance(state.destination, root.Position)
+        if distance <= 4 then
+            state.orbitAngle = state.orbitAngle + RUNNING_ORBIT_STEP
+            state.destination = runningOrbitPoint(
+                stagePart,
+                center,
+                state.orbitAngle,
+                state.orbitRadius
+            )
+            distance = planarDistance(state.destination, root.Position)
+        end
+        return distance
+    end
+
+    local function jumpWhileRunning(humanoid, now)
+        if now - state.lastJumpAt < RUNNING_JUMP_INTERVAL then return end
+        local grounded, floorMaterial = pcall(function()
+            return humanoid.FloorMaterial
+        end)
+        if not grounded or floorMaterial == Enum.Material.Air then return end
+        local jumped = pcall(function()
+            humanoid.Jump = true
+        end)
+        if jumped then state.lastJumpAt = now end
+    end
+
+    local function notifyReset(mode)
+        if type(context) == "table" and type(context.notify) == "function" then
+            pcall(
+                context.notify,
+                tostring(mode) .. " stuck for 20s; resetting character"
+            )
+        end
+    end
+
+    local function updateStall(stage, mode, humanoid, character, root, now)
+        if state.lastPosition == nil
+            or planarDistance(root.Position, state.lastPosition) >= 1
+        then
+            state.lastPosition = root.Position
+            state.lastMovedAt = now
+        elseif now - state.lastMovedAt >= 20 then
+            if state.resetUsedStage == stage then
+                stopMovement()
+                state.blockedStage = stage
+                return "stage "
+                    .. tostring(stage)
+                    .. " "
+                    .. string.lower(mode)
+                    .. " paused after repeated stall"
+            end
+            local stuckHumanoid = humanoid
+            local stuckCharacter = character
+            stopMovement()
+            state.resetUsedStage = stage
+            state.resetHumanoid = stuckHumanoid
+            state.resetCharacter = stuckCharacter
+            state.resetDeadline = now + 15
+            notifyReset(mode)
+            local requested = pcall(function()
+                stuckHumanoid:ChangeState(Enum.HumanoidStateType.Dead)
+            end)
+            if not requested then
+                state.resetDeadline = now
+                return "stage " .. tostring(stage) .. " character reset unavailable"
+            end
+            return "stage " .. tostring(stage) .. " resetting stuck character"
+        end
+        return nil
     end
 
     local function startWatchdog(generation)
@@ -504,15 +647,22 @@ function Module.create(context)
     end
 
     function api:GetModes()
-        return { "Walking" }
+        return { "Walking", "Running" }
     end
 
     function api:Supports(mode)
-        return mode == "Walking"
+        return mode == "Walking" or mode == "Running"
     end
 
     function api:Install(group)
         if broom.installed then return true end
+        group:AddSlider("RunningDistance", {
+            Text = "Running distance from center",
+            Default = DEFAULT_RUNNING_DISTANCE,
+            Min = MIN_RUNNING_DISTANCE,
+            Max = MAX_RUNNING_DISTANCE,
+            Rounding = 0,
+        })
         group:AddToggle("AutoBroom", {
             Text = "Auto Broom",
             Default = false,
@@ -599,7 +749,7 @@ function Module.create(context)
     end
 
     function api:Prepare(mode, stage, stagePart)
-        if mode ~= "Walking" or stagePart == nil then
+        if (mode ~= "Walking" and mode ~= "Running") or stagePart == nil then
             resetAll()
             return
         end
@@ -609,11 +759,13 @@ function Module.create(context)
             state.resetUsedStage = nil
             state.blockedStage = nil
         end
-        local routeChanged = state.preparedStage ~= stage
+        local routeChanged = state.preparedMode ~= mode
+            or state.preparedStage ~= stage
             or state.preparedStagePart ~= stagePart
 
         if routeChanged then
             stopMovement()
+            state.preparedMode = mode
             state.preparedStage = stage
             state.preparedStagePart = stagePart
             state.routeChangedAt = now
@@ -621,7 +773,7 @@ function Module.create(context)
     end
 
     function api:Update(mode, stage, stagePart, root, destination)
-        if mode ~= "Walking" then
+        if mode ~= "Walking" and mode ~= "Running" then
             resetAll()
             return "locomotion mode unavailable"
         end
@@ -631,7 +783,10 @@ function Module.create(context)
             return "stage " .. tostring(stage) .. " waiting for destination"
         end
 
-        if state.preparedStage ~= stage or state.preparedStagePart ~= stagePart then
+        if state.preparedMode ~= mode
+            or state.preparedStage ~= stage
+            or state.preparedStagePart ~= stagePart
+        then
             api:Prepare(mode, stage, stagePart)
         end
 
@@ -664,7 +819,11 @@ function Module.create(context)
                 return "stage " .. tostring(stage) .. " waiting for character reset"
             else
                 stopMovement()
-                return "stage " .. tostring(stage) .. " reset not accepted; walking paused"
+                return "stage "
+                    .. tostring(stage)
+                    .. " reset not accepted; "
+                    .. string.lower(mode)
+                    .. " paused"
             end
         end
 
@@ -679,16 +838,21 @@ function Module.create(context)
 
         if state.blockedStage == stage then
             stopMovement()
-            return "stage " .. tostring(stage) .. " walking paused after repeated stall"
+            return "stage "
+                .. tostring(stage)
+                .. " "
+                .. string.lower(mode)
+                .. " paused after repeated stall"
         end
 
         local finalDistance = planarDistance(destination, root.Position)
-        if finalDistance <= 4 then
+        if mode == "Walking" and finalDistance <= 4 then
             stopMovement()
             return "stage " .. tostring(stage) .. " walking arrived"
         end
 
         local sameRoute = state.active
+            and state.mode == mode
             and state.stage == stage
             and state.stagePart == stagePart
             and state.humanoid == humanoid
@@ -707,6 +871,7 @@ function Module.create(context)
             state.active = true
             state.enteredStage = isOverFootprint(stagePart, root.Position)
             state.generation = state.generation + 1
+            state.mode = mode
             state.stage = stage
             state.stagePart = stagePart
             state.humanoid = humanoid
@@ -716,6 +881,10 @@ function Module.create(context)
             state.phase = phase
             state.lastPosition = root.Position
             state.lastMovedAt = now
+
+            if mode == "Running" and state.enteredStage then
+                startRunningOrbit(stagePart, root, destination)
+            end
 
             local moved = pcall(function()
                 runService:UnbindFromRenderStep(bindName)
@@ -757,7 +926,34 @@ function Module.create(context)
             startWatchdog(state.generation)
         end
 
-        hasEnteredStage()
+        local enteredStage = hasEnteredStage()
+
+        if mode == "Running" and enteredStage then
+            local distance = updateRunningOrbit(
+                stagePart,
+                root,
+                destination
+            )
+            jumpWhileRunning(humanoid, now)
+
+            local stallStatus = updateStall(
+                stage,
+                mode,
+                humanoid,
+                character,
+                root,
+                now
+            )
+            if stallStatus ~= nil then return stallStatus end
+
+            state.heartbeat = now
+            return string.format(
+                "stage %d running %.1f studs from center; waypoint %.1f studs",
+                stage,
+                state.orbitRadius,
+                distance
+            )
+        end
 
         local distance = planarDistance(state.destination, root.Position)
         if state.phase == "align" and distance <= 4 then
@@ -768,42 +964,23 @@ function Module.create(context)
             distance = planarDistance(destination, root.Position)
         end
 
-        if state.phase == "final" and distance <= 4 then
+        if mode == "Walking" and state.phase == "final" and distance <= 4 then
             stopMovement()
             return "stage " .. tostring(stage) .. " walking arrived"
         end
 
-        if state.lastPosition == nil
-            or planarDistance(root.Position, state.lastPosition) >= 1
-        then
-            state.lastPosition = root.Position
-            state.lastMovedAt = now
-        elseif now - state.lastMovedAt >= 20 then
-            if state.resetUsedStage == stage then
-                stopMovement()
-                state.blockedStage = stage
-                return "stage " .. tostring(stage) .. " walking paused after repeated stall"
-            end
-            local stuckHumanoid = humanoid
-            local stuckCharacter = character
-            stopMovement()
-            state.resetUsedStage = stage
-            state.resetHumanoid = stuckHumanoid
-            state.resetCharacter = stuckCharacter
-            state.resetDeadline = now + 15
-            notifyReset()
-            local requested = pcall(function()
-                stuckHumanoid:ChangeState(Enum.HumanoidStateType.Dead)
-            end)
-            if not requested then
-                state.resetDeadline = now
-                return "stage " .. tostring(stage) .. " character reset unavailable"
-            end
-            return "stage " .. tostring(stage) .. " resetting stuck character"
-        end
+        local stallStatus = updateStall(
+            stage,
+            mode,
+            humanoid,
+            character,
+            root,
+            now
+        )
+        if stallStatus ~= nil then return stallStatus end
 
         state.heartbeat = now
-        local action = state.phase == "align" and "aligning" or "walking"
+        local action = state.phase == "align" and "aligning" or string.lower(mode)
         return string.format("stage %d %s %.1f studs", stage, action, distance)
     end
 
