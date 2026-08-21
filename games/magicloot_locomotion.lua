@@ -90,8 +90,6 @@ function Module.create(context)
         installed = false,
         workerStarted = false,
         bridge = nil,
-        dropdown = nil,
-        fingerprint = "",
         labelsById = {},
         lastEquipAt = -math.huge,
     }
@@ -477,31 +475,15 @@ function Module.create(context)
         return values, labelsById
     end
 
-    local function refreshWandDropdown()
-        local values, labelsById = wandCatalogValues()
-        local fingerprint = table.concat(values, "\30")
-        if fingerprint == wand.fingerprint then return end
-        local selectedId = selectedWandId(selectedWandOption())
-        wand.fingerprint = fingerprint
-        wand.labelsById = labelsById
-        if wand.dropdown == nil or type(wand.dropdown.SetValues) ~= "function" then
-            return
-        end
-        wand.dropdown:SetValues(values)
-        local selected = selectedId and labelsById[selectedId] or WAND_PLACEHOLDER
-        if type(wand.dropdown.SetValue) == "function" then
-            wand.dropdown:SetValue(selected)
-        end
-    end
-
     local function updateSelectedWand()
-        refreshWandDropdown()
         if not broom.configReady or not selectedWandToggle() then return end
+        local challenge = inDungeonChallenge()
+        if challenge == nil or challenge <= 0 then return end
         local selectedId = selectedWandId(selectedWandOption())
         if selectedId == nil or wand.labelsById[selectedId] == nil then return end
 
-        -- The selected mode owns Wand equip while enabled, preventing the
-        -- original Best worker from repeatedly replacing the chosen wand.
+        -- Selected Wand only owns equipment inside a stage. At the base it
+        -- leaves manual equipment untouched.
         wandCall(5)
         local ownedOk, owned = wandCall(2, selectedId)
         if not ownedOk or owned ~= true then return end
@@ -838,9 +820,8 @@ function Module.create(context)
                 Default = false,
             })
             local values, labelsById = wandCatalogValues()
-            wand.fingerprint = table.concat(values, "\30")
             wand.labelsById = labelsById
-            wand.dropdown = group:AddDropdown("SelectedWand", {
+            group:AddDropdown("SelectedWand", {
                 Text = "Selected Wand",
                 Values = values,
                 Default = WAND_PLACEHOLDER,
