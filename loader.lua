@@ -11,7 +11,7 @@ if identifyexecutor then
     end
 end
 
-local BASE = 'https://raw.githubusercontent.com/InfinityControlR/Magic/main/games/'
+local BASE = 'https://raw.githubusercontent.com/InfinityControlR/Magic/73c22a9c87b9265251fd58e9ae2265439ebfd70a/games/'
 local LOCOMOTION = 'https://raw.githubusercontent.com/InfinityControlR/Magic/a8d966b6ac586312cd7275400bc3ecca7cf47893/games/magicloot_locomotion.lua'
 
 local games = {
