@@ -1,4 +1,4 @@
--- Magic Loot external controller - Walking/Running locomotion plus native Broom jump
+-- Magic Loot external controller - locomotion, Broom and selected Wand equip
 --
 -- This module never teleports the character and never changes movement speed.
 -- It is loaded behind a protected bridge in the main script; a load/runtime
@@ -83,6 +83,17 @@ function Module.create(context)
         requestAttempts = 0,
         activations = 0,
         status = "broom disabled",
+    }
+    local WAND_PLACEHOLDER = "Select a wand"
+    local wand = {
+        alive = true,
+        installed = false,
+        workerStarted = false,
+        bridge = nil,
+        dropdown = nil,
+        fingerprint = "",
+        labelsById = {},
+        lastEquipAt = -math.huge,
     }
 
     local function broomOption(name, fallback)
@@ -352,6 +363,169 @@ function Module.create(context)
                 task.wait(ok and 0.1 or 1)
             end
             broom.alive = false
+        end)
+    end
+
+    local function wandCall(action, id)
+        local bridge = wand.bridge
+        if type(bridge) ~= "table" then return false, nil end
+        if action == 1 and type(bridge[1]) == "function" then
+            local ok, result = pcall(bridge[1], "weaponConf", 9)
+            return ok, result
+        end
+        if action == 2 and type(bridge[2]) == "function" then
+            local ok, result = pcall(bridge[2], id, 9)
+            return ok, result
+        end
+        if action == 3 and type(bridge[3]) == "function" then
+            local ok, result = pcall(bridge[3], "Wand")
+            return ok, result
+        end
+        if action == 4 and type(bridge[4]) == "function" then
+            local ok, result = pcall(bridge[4], "EQUIP_SHOP_EQUIP", {
+                equipID = id,
+                itemType = 9,
+            })
+            return ok, result
+        end
+        if action == 5 then
+            local registry = bridge[5]
+            local option = type(registry) == "table" and registry.AutoEquipWand
+            if type(option) == "table" and type(option.SetValue) == "function" then
+                local ok, result = pcall(option.SetValue, option, false)
+                return ok, result
+            end
+            return true, true
+        end
+        return false, nil
+    end
+
+    local function selectedWandId(value)
+        local direct = tonumber(value)
+        if direct ~= nil and direct > 0 then return math.floor(direct) end
+        if type(value) == "string" then
+            local parsed = tonumber(string.match(value, "^#(%d+)"))
+            return parsed and math.floor(parsed) or nil
+        end
+        if type(value) == "table" then
+            for candidate, enabled in pairs(value) do
+                if enabled then
+                    local parsed = selectedWandId(candidate)
+                    if parsed ~= nil then return parsed end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function selectedWandOption()
+        if type(context.option) ~= "function" then return WAND_PLACEHOLDER end
+        local ok, value = pcall(context.option, "SelectedWand", WAND_PLACEHOLDER)
+        return ok and value ~= nil and value or WAND_PLACEHOLDER
+    end
+
+    local function selectedWandToggle()
+        if type(context.toggle) ~= "function" then return false end
+        local ok, value = pcall(context.toggle, "AutoEquipSelectedWand")
+        return ok and value == true
+    end
+
+    local function wandCatalogValues()
+        local ok, raw = wandCall(1)
+        local entries = {}
+        local seen = {}
+        if ok and type(raw) == "table" then
+            for _, value in pairs(raw) do
+                if type(value) == "table" then
+                    local id = tonumber(value.id)
+                        or tonumber(value.ID)
+                        or tonumber(value.Id)
+                    if id ~= nil and id > 0 then
+                        id = math.floor(id)
+                        if not seen[id] then
+                            seen[id] = true
+                            table.insert(entries, {
+                                id = id,
+                                price = tonumber(value.price)
+                                    or tonumber(value.Price)
+                                    or 0,
+                                name = value.name
+                                    or value.Name
+                                    or value.ZhName
+                                    or value.DisplayName,
+                            })
+                        end
+                    end
+                end
+            end
+        end
+        table.sort(entries, function(left, right)
+            if left.price ~= right.price then return left.price > right.price end
+            return left.id < right.id
+        end)
+
+        local values = { WAND_PLACEHOLDER }
+        local labelsById = {}
+        for _, entry in ipairs(entries) do
+            local name = type(entry.name) == "string" and entry.name ~= ""
+                and entry.name
+                or ("Wand " .. tostring(entry.id))
+            local label = "#" .. tostring(entry.id) .. " " .. name
+            labelsById[entry.id] = label
+            table.insert(values, label)
+        end
+        return values, labelsById
+    end
+
+    local function refreshWandDropdown()
+        local values, labelsById = wandCatalogValues()
+        local fingerprint = table.concat(values, "\30")
+        if fingerprint == wand.fingerprint then return end
+        local selectedId = selectedWandId(selectedWandOption())
+        wand.fingerprint = fingerprint
+        wand.labelsById = labelsById
+        if wand.dropdown == nil or type(wand.dropdown.SetValues) ~= "function" then
+            return
+        end
+        wand.dropdown:SetValues(values)
+        local selected = selectedId and labelsById[selectedId] or WAND_PLACEHOLDER
+        if type(wand.dropdown.SetValue) == "function" then
+            wand.dropdown:SetValue(selected)
+        end
+    end
+
+    local function updateSelectedWand()
+        refreshWandDropdown()
+        if not broom.configReady or not selectedWandToggle() then return end
+        local selectedId = selectedWandId(selectedWandOption())
+        if selectedId == nil or wand.labelsById[selectedId] == nil then return end
+
+        -- The selected mode owns Wand equip while enabled, preventing the
+        -- original Best worker from repeatedly replacing the chosen wand.
+        wandCall(5)
+        local ownedOk, owned = wandCall(2, selectedId)
+        if not ownedOk or owned ~= true then return end
+        local currentOk, current = wandCall(3)
+        if currentOk and math.floor(tonumber(current) or 0) == selectedId then return end
+        local now = os.clock()
+        if now - wand.lastEquipAt < 2 then return end
+        wand.lastEquipAt = now
+        wandCall(4, selectedId)
+    end
+
+    local function startWandWorker()
+        if wand.workerStarted then return end
+        wand.workerStarted = true
+        task.spawn(function()
+            while wand.alive do
+                if type(context.alive) == "function" then
+                    local aliveOk, hostAlive = pcall(context.alive)
+                    if not aliveOk or hostAlive == false then break end
+                end
+                local ok = pcall(updateSelectedWand)
+                task.wait(ok and 2 or 1)
+            end
+            wand.alive = false
         end)
     end
 
@@ -655,7 +829,28 @@ function Module.create(context)
         return mode == "Walking" or mode == "Running"
     end
 
-    function api:Install(group)
+    function api:Install(group, kind, bridge)
+        if kind == 1 or kind == "Wand" then
+            if wand.installed then return true end
+            wand.bridge = bridge
+            group:AddToggle("AutoEquipSelectedWand", {
+                Text = "Auto Equip Selected Wand",
+                Default = false,
+            })
+            local values, labelsById = wandCatalogValues()
+            wand.fingerprint = table.concat(values, "\30")
+            wand.labelsById = labelsById
+            wand.dropdown = group:AddDropdown("SelectedWand", {
+                Text = "Selected Wand",
+                Values = values,
+                Default = WAND_PLACEHOLDER,
+                Multi = false,
+                Searchable = true,
+            })
+            wand.installed = true
+            startWandWorker()
+            return true
+        end
         if broom.installed then return true end
         group:AddSlider("RunningDistance", {
             Text = "Running distance from center",
@@ -1003,6 +1198,7 @@ function Module.create(context)
     function api:Stop()
         invalidateBroomTransaction()
         broom.alive = false
+        wand.alive = false
         broom.configReady = false
         broom.enabled = false
         broom.returnEpisode = false
